@@ -1,0 +1,338 @@
+---
+title: Bioenergetic crisis in Intensive Care Unit Acquired Weakness gene signatures were associated with sepsis-related mortality
+author: Seibi Kobara
+output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_float: yes
+    toc_collapse: no
+---
+
+```{r include=FALSE}
+library(limma)
+library(GEOquery)
+library(pheatmap)
+library(topGO)
+library(AnnotationDbi)
+library(illuminaHumanv4.db)
+library(clusterProfiler)
+library(ggplot2)
+library(tidyverse)
+library(magrittr)
+library(egg)
+library(annotate)
+library(pathview)
+library(ggpubr)
+```
+
+# Import file
+```{r message=FALSE}
+gse <- getGEO("GSE54514")[[1]]
+```
+
+# Inspect clinical variables
+```{r message=FALSE}
+# Sample information
+sampleInfo <- pData(gse)
+
+# Select variables you want to store
+sampleInfo <- dplyr::select(sampleInfo,
+                     "age (years):ch1",
+                     "disease status:ch1",
+                     "gender:ch1",
+                     "group_day:ch1",
+                     "group_id:ch1",
+                     "severity (apacheii):ch1",
+                     "site of infection:ch1")
+
+# Rename to more convenient column names
+sampleInfo <- dplyr::rename(sampleInfo,
+                     age="age (years):ch1",
+                     disease_status="disease status:ch1",
+                     gender="gender:ch1",
+                     group_day="group_day:ch1",
+                     group_ID="group_id:ch1",
+                     APACHE2= "severity (apacheii):ch1",
+                     site_of_infection="site of infection:ch1")
+
+# Categorization of sample information (age, APACHE II)
+sampleInfo$age<-as.numeric(sampleInfo$age)
+sampleInfo$APACHE2<-as.numeric(sampleInfo$APACHE2)
+sampleInfo$Age<-factor(ifelse(sampleInfo$age<40,1,
+                                       ifelse(sampleInfo$age>=40 & sampleInfo$age<60,2,
+                                              ifelse(sampleInfo$age>=60 & sampleInfo$age<80,3,4))),
+                         levels = c(1:4),
+                         labels = c("<40","40-60","60-80","<80"))
+sampleInfo$APACHE_II<-factor(ifelse(is.na(sampleInfo$APACHE2),NA,
+                            ifelse(sampleInfo$APACHE2<15,1,
+                            ifelse(sampleInfo$APACHE2>=15 &sampleInfo$APACHE2<20,2,
+                            ifelse(sampleInfo$APACHE2>=20 &sampleInfo$APACHE2<25,3,4)))),
+                         levels = c(1:4),
+                         labels = c("<15","15-20","20-25","<25"))
+
+sampleInfo$Mortality <- ifelse(sampleInfo$disease_status =="sepsis nonsurvivor","Non-Survivor",
+                               ifelse(sampleInfo$disease_status =="sepsis survivor","Survivor","healthy"))
+
+
+# ID, group
+sampleInfo<-tidyr::separate(sampleInfo,col="group_ID",into=c("group","ID"),sep="_")
+
+# total population (lung and bacteremia)
+# only day 1
+sampleInfo1 <- sampleInfo %>% filter(group_day %in% c("NS_D1","S_D1")) %>%
+    filter(site_of_infection %in% c("blood","lung","UT")) 
+saveRDS(sampleInfo1,"sampleInfo.rds")
+```
+
+# Preprocess
+```{r}
+# Preprocess
+# calculate median expression level
+ex<-exprs(gse)
+dim(ex)
+# 24840   163
+cutoff <- median(ex)
+isexpressed<- ex > cutoff
+
+# expressed more than 3 samples
+keep <- rowSums(isexpressed) >2
+table(keep)
+# FALSE  TRUE 
+#  863 23977 
+
+# available genes
+ex1<- ex[keep,]
+dim(ex1 )
+# 23977   163
+
+# annotation
+anno<- AnnotationDbi::select(illuminaHumanv4.db, keytype = "PROBEID", 
+                             keys =rownames(ex1), 
+                            columns = c("ENTREZID") )
+ex1<-as.data.frame(ex1)
+ex1 %<>% mutate(affy=rownames(ex1))
+# merge
+ex2<- merge(ex1, anno, all.x=T, by.x="affy",by.y="PROBEID")
+
+# drop affy
+ex3<-ex2[,-c(1)]
+
+# Remove NA in entrez ID
+table(is.na(ex3$ENTREZID))
+# FALSE  TRUE 
+# 19658  5264 
+
+ex4<-ex3[!is.na(ex3$ENTREZID),]
+dim(ex4)
+# 19658   164
+
+# Duplicated 
+table(duplicated(ex4$ENTREZID)) 
+# FALSE  TRUE 
+# 13972  5686
+
+# Remove duplicate by taking median
+# only entrezID and expression
+ex5 <- ex4 %>% group_by(ENTREZID) %>% summarise_all(median)
+dim(ex5)
+saveRDS(ex5,"expression.rds")
+# 13972   164
+```
+
+# ICUAW associated genes from GSE78929
+```{r}
+# load data
+AWgenelist<-readRDS("ICUAW_associated_genes.rds")
+dim(AWgenelist)
+
+# annotation: illumina to entrez
+AW_list<- AnnotationDbi::select(illuminaHumanv4.db, keytype = "PROBEID", 
+                             keys =AWgenelist$illumina_ID, 
+                            columns = c("ENTREZID") )
+
+# remove unavailable for entrez
+AW_list<-AW_list[!is.na(AW_list$ENTREZID),] 
+dim(AW_list)
+# 675 2
+# remove duplicated
+AW_list2 <- AW_list[!duplicated(AW_list$ENTREZID),]
+dim(AW_list2)
+# 608 2
+```
+
+```{r}
+#expression set for ICUAW
+exp<-ex5 %>% filter(ENTREZID %in% AW_list$ENTREZID) 
+expression <- exp %>% dplyr::select(rownames(sampleInfo))
+expression %<>% mutate(ENTREZID=exp$ENTREZID)
+saveRDS(expression,"ICUAWexpression.rds")
+```
+
+# Primary analysis 
+# Differential gene expression analysis between non-survivors and survivors among patients with primary bacteremia- and respiratory-triggered sepsis
+```{r}
+# load
+sample<-readRDS("sampleInfo.rds")          # 21 samples  11 variables
+expression<-readRDS("ICUAWexpression.rds") # 526 36 (35 + entrez)
+
+# expression
+expression<- expression %>% dplyr::select(ENTREZID,rownames(sample))
+dim(expression)
+# 526 22 (21 + entrez)
+
+# Model matrix
+design <- model.matrix(~0+sample$Mortality + sample$age)
+# Rename column name
+colnames(design) <- c("non_surv","surv","age")
+
+# Fitting
+fit <- lmFit(expression[,-c(1)], design)
+
+# Make contrast set
+contrasts<- makeContrasts(non_surv - surv,levels=design)
+
+# Fit
+fit2 <- contrasts.fit(fit, contrasts)
+
+# Bayes 
+fit2 <- eBayes(fit2)
+
+# annotation
+anno<- AnnotationDbi::select(illuminaHumanv4.db, keytype = "ENTREZID", 
+                             keys =as.character(expression$ENTREZID), 
+                            columns = c("SYMBOL") )
+
+fit2$genes <- anno
+
+# Toptable
+toptable <- topTable(fit2,coef = 1, number=Inf)
+toptable %<>% mutate(direction=ifelse(logFC>0, "up","down"))
+```
+## GO enrichment analysis
+```{r}
+# EnrichGO for all
+sig_gene<- toptable %>% filter(adj.P.Val<0.05 & abs(logFC)>0.5)
+
+direction<-c("up","down")
+ontology<-c("BP","CC","MF")
+ego_all<-data.frame()
+for (i in direction){
+  df<-sig_gene %>% filter(direction==i)
+  for(j in ontology){
+  ego <- enrichGO(gene = df[[1]],
+                keyType = "ENTREZID",
+                OrgDb = org.Hs.eg.db, 
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                minGSSize = 10,
+                maxGSSize = 500,
+                ont = j,
+                readable = TRUE)
+  ego<- data.frame(ego)
+  ego <- ego %>% mutate(direction=i)
+  ego <- ego %>% mutate(ontology=j)
+  ego_all<-rbind(ego_all,ego)
+  }}
+```
+
+## KEGG pathway enrichment analysis
+```{r}
+# for all
+sig_gene<- toptable %>% filter(adj.P.Val<0.05 & abs(logFC)>0.5)
+
+KEGG_all<-data.frame()
+for (i in direction){
+  df<-sig_gene %>% filter(direction==i)
+  k <- enrichKEGG(gene = df[[1]], organism = 'hsa',pvalueCutoff = 0.05,)
+  k <-as.data.frame(k)
+  k<- k %>% mutate(direction=i)
+  KEGG_all<-rbind(KEGG_all,k)
+}
+```
+
+# Secondary analysis 
+# Differential gene expression analysis among respiratory-triggered sepsis
+
+```{r}
+soi<-c("blood","lung") # soi: site of infection
+toptable_soi <- data.frame()
+for(i in soi){
+  # Model matrix
+  sample_select<-sample %>% filter(site_of_infection==i)
+  exp<- expression %>% dplyr::select(rownames(sample_select))
+  design <- model.matrix(~0+sample_select$Mortality + sample_select$age)
+  # Rename column name
+  colnames(design) <- c("non_surv","surv","age")
+  # Fitting
+  fit <- lmFit(exp, design)
+  # Make contrast set
+  contrasts<- makeContrasts(non_surv - surv, levels=design)
+  # Fit
+  fit2 <- contrasts.fit(fit, contrasts)
+  # Bayes 
+  fit2 <- eBayes(fit2)
+  # annotation
+  anno<- AnnotationDbi::select(illuminaHumanv4.db, keytype = "ENTREZID", 
+                             keys =as.character(expression$ENTREZID), 
+                            columns = c("SYMBOL") )
+  fit2$genes <- anno
+  # Toptable
+  toptable <- topTable(fit2,coef = 1, number=Inf)
+  toptable %<>% mutate(direction=ifelse(logFC>0, "up","down"))
+  toptable %<>% mutate(soi=i)
+  toptable_soi <- rbind(toptable_soi,toptable)
+}
+```
+
+## GO enrichment analysis
+
+```{r}
+# EnrichGO for soi
+sig_gene<- toptable_soi %>% filter(adj.P.Val<0.05 & abs(logFC)>0.5)
+
+direction<-c("up","down")
+ontology<-c("BP","CC","MF")
+soi<- c("lung","UT")
+ego_soi<-data.frame()
+for(k in soi){
+  df0<-sig_gene %>% filter(soi==k)
+  for (i in direction){
+    df<-df0 %>% filter(direction==i)
+    for(j in ontology){
+      ego <- enrichGO(gene = df[[1]],
+                keyType = "ENTREZID",
+                OrgDb = org.Hs.eg.db, 
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05,
+                qvalueCutoff = 0.05,
+                minGSSize = 10,
+                maxGSSize = 500,
+                ont = j,
+                readable = TRUE)
+      ego<- data.frame(ego)
+      ego %<>% mutate(soi=k)
+      ego %<>% mutate(direction=i)
+      ego %<>% mutate(ontology=j)
+      ego_soi<-rbind(ego_soi,ego)
+}}}
+```
+
+## KEGG pathway enrichment analysis
+```{r}
+# for soi
+sig_gene<- toptable_soi %>% filter(adj.P.Val<0.05 & abs(logFC)>0.5)
+soi<- c("lung","UT")
+KEGG_soi<-data.frame()
+for(k in soi){
+  df0<- sig_gene %>% filter(soi==k)
+  for (i in direction){
+    df<- df0 %>% filter(direction==i)
+    kegg <- enrichKEGG(gene = df[[1]], organism = 'hsa',pvalueCutoff = 0.05,)
+    kegg <- data.frame(kegg)
+    kegg %<>% mutate(direction=i)
+    kegg %<>% mutate(soi=k)
+    KEGG_soi<-rbind(KEGG_soi,kegg)
+}}
+```
